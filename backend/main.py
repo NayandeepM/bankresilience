@@ -310,8 +310,9 @@ async def start_edge_timeout_experiment(payload: StartExperimentRequest, request
         started_at = utc_now()
         state.update(active=True, events=[], experiment={
             "id": experiment_id, "name": spec["name"], "target": spec["target"],
-            "failure_type": spec["failure_type"], "status": "running", "started_at": started_at,
+            "failure_type": spec["failure_type"], "status": "running", "phase": "baseline", "started_at": started_at,
             "failure_window_seconds": 12,
+            "live_metrics": {phase: phase_metrics([]) for phase in ("before", "during", "after")},
         })
         add_event(f"Upstream preflight passed at {UPSTREAM_URL}.", "Safety Controller")
         asyncio.create_task(run_timeout_experiment(experiment_id, started_at, proxy_url))
@@ -353,6 +354,55 @@ def phase_metrics(probes: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+async def recorded_timeout_probe(proxy_url: str, phase: str, observations: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    observation = await probe_proxy(proxy_url, phase)
+    if phase == "after":
+        observation["completed_at"] = time.monotonic()
+    observations[phase].append(observation)
+    metrics = phase_metrics(observations[phase])
+    state["experiment"]["live_metrics"][phase] = metrics
+    if phase == "during" and metrics["requests"] in {3, 6, 9, 12}:
+        observed_504 = metrics["status_counts"].get("504", 0)
+        add_event(
+            f"Fault-window probes: {metrics['requests']}/12 complete; {observed_504} HTTP 504, "
+            f"{metrics['errors']} total errors, {metrics['latency_avg_ms']} ms average latency.",
+            "Observability Agent",
+        )
+    return observation
+
+
+def timeout_diagnosis(result: dict[str, Any], fault_activated: bool) -> dict[str, Any]:
+    before, during, after = (result["phases"][phase] for phase in ("before", "during", "after"))
+    observed_504 = during["status_counts"].get("504", 0)
+    if not fault_activated:
+        conclusion = "Timeout fault was not injected; the baseline or setup failed."
+    elif observed_504 == during["requests"] and during["requests"]:
+        conclusion = f"All {observed_504} fault-window probes returned HTTP 504 while the timeout fault was active."
+    elif observed_504:
+        conclusion = f"{observed_504} of {during['requests']} fault-window probes returned HTTP 504; the observed outcome was mixed."
+    else:
+        conclusion = "The timeout fault was activated, but no HTTP 504 response was observed."
+
+    evidence = [
+        f"Before: {before['requests']} probes, errors: {before['errors']}, average latency: {before['latency_avg_ms']} ms.",
+        f"During: {during['requests']} probes, HTTP 504: {observed_504}, total errors: {during['errors']}, average latency: {during['latency_avg_ms']} ms.",
+        f"After: {after['requests']} probes, errors: {after['errors']}, average latency: {after['latency_avg_ms']} ms.",
+    ]
+    if result["time_to_recover_seconds"] is not None:
+        evidence.append(f"First healthy post-fault response arrived {result['time_to_recover_seconds']} s after fault clearing.")
+    if result.get("error"):
+        evidence.append(f"Experiment warning: {result['error']}")
+    return {
+        "root_cause": conclusion,
+        "evidence": evidence,
+        "recommended_action": (
+            "All post-fault probes succeeded. Keep monitoring the upstream for application-level recovery."
+            if result["recovered"] else
+            "Recovery was not verified. Check the upstream, proxy, and failed probe details before rerunning."
+        ),
+    }
+
+
 async def run_timeout_experiment(experiment_id: str, started_at: str, proxy_url: str) -> None:
     spec = EXPERIMENTS["edge-timeout"]
     result: dict[str, Any] = {
@@ -365,7 +415,7 @@ async def run_timeout_experiment(experiment_id: str, started_at: str, proxy_url:
     fault_activated = False
     try:
         for _ in range(3):
-            observations["before"].append(await probe_proxy(proxy_url, "before"))
+            await recorded_timeout_probe(proxy_url, "before", observations)
             await asyncio.sleep(1)
         if any(probe["error"] for probe in observations["before"]):
             raise RuntimeError("Proxy baseline failed before injection.")
@@ -377,7 +427,7 @@ async def run_timeout_experiment(experiment_id: str, started_at: str, proxy_url:
         add_event("Injecting traffic-level timeout for 12 seconds; requests return 504 after a 3-second hold.",
                   "Chaos Agent", "warning")
         for _ in range(12):
-            outstanding.append(asyncio.create_task(probe_proxy(proxy_url, "during")))
+            outstanding.append(asyncio.create_task(recorded_timeout_probe(proxy_url, "during", observations)))
             await asyncio.sleep(1)
     except Exception as exc:
         result["error"] = str(exc)
@@ -386,11 +436,10 @@ async def run_timeout_experiment(experiment_id: str, started_at: str, proxy_url:
         cleared_at = time.monotonic()
         clear_timeout_fault()
         if fault_activated:
+            state["experiment"]["phase"] = "recovery-check"
             add_event("Timeout fault cleared; verifying proxy recovery.", "Recovery Agent")
         for _ in range(3):
-            observation = await probe_proxy(proxy_url, "after")
-            observation["completed_at"] = time.monotonic()
-            observations["after"].append(observation)
+            await recorded_timeout_probe(proxy_url, "after", observations)
             await asyncio.sleep(1)
         if outstanding:
             done, pending = await asyncio.wait(outstanding, timeout=5)
@@ -398,12 +447,13 @@ async def run_timeout_experiment(experiment_id: str, started_at: str, proxy_url:
                 if task.cancelled():
                     continue
                 try:
-                    observations["during"].append(task.result())
+                    task.result()
                 except Exception as exc:
                     observations["during"].append({
                         "phase": "during", "status_code": None, "error": True,
                         "latency_ms": 0, "detail": str(exc),
                     })
+                    state["experiment"]["live_metrics"]["during"] = phase_metrics(observations["during"])
             for task in pending:
                 task.cancel()
             if pending:
@@ -419,25 +469,19 @@ async def run_timeout_experiment(experiment_id: str, started_at: str, proxy_url:
         }
         first_healthy = next((probe for probe in observations["after"] if not probe["error"]), None)
         result["time_to_recover_seconds"] = (
-            round(first_healthy["completed_at"] - cleared_at, 2) if first_healthy else None
+            round(first_healthy["completed_at"] - cleared_at, 3) if first_healthy else None
         )
-        result["recovered"] = bool(fault_activated and first_healthy and not result.get("error"))
+        result["recovered"] = bool(
+            fault_activated and first_healthy and result["phases"]["after"]["requests"] == 3
+            and result["phases"]["after"]["errors"] == 0 and not result.get("error")
+        )
         result["recovery_verified"] = result["recovered"]
-        result["diagnosis"] = {
-            "root_cause": "The local proxy deliberately delayed requests and returned HTTP 504.",
-            "confidence": 1.0 if result["phases"]["during"]["errors"] else 0.0,
-            "evidence": [
-                f"Fault-window requests: {result['phases']['during']['requests']}",
-                f"Fault-window errors: {result['phases']['during']['errors']}",
-                f"Post-fault successful requests: {result['phases']['after']['requests'] - result['phases']['after']['errors']}",
-            ],
-            "recommended_action": "The proxy fault clears automatically; verify the upstream remains healthy.",
-        }
+        result["diagnosis"] = timeout_diagnosis(result, fault_activated)
         state["experiment"]["diagnosis"] = result["diagnosis"]
-        result["status"] = "recovered-needs-transaction-check" if result["recovered"] else "failed-or-unverified"
+        result["status"] = "recovered" if result["recovered"] else "failed-or-unverified"
         result["finished_at"] = utc_now()
         if result["recovered"]:
-            add_event("Proxy recovered: a post-fault request succeeded.", "Recovery Agent", "success")
+            add_event("Proxy recovered: all three post-fault probes succeeded.", "Recovery Agent", "success")
         else:
             add_event("Proxy recovery could not be verified.", "Recovery Agent", "error")
         state["experiment"].update(status=result["status"], finished_at=result["finished_at"], result=result)

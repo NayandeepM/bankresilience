@@ -28,5 +28,27 @@ class ProxyExpiryTests(unittest.IsolatedAsyncioTestCase):
             main.fault_state.update(original)
 
 
+class TimeoutDiagnosisTests(unittest.TestCase):
+    def test_mixed_responses_are_reported_as_partial_and_unverified(self):
+        def probe(status):
+            return {"status_code": status, "error": status is None or status >= 500, "latency_ms": 10.0}
+
+        result = {
+            "phases": {
+                "before": main.phase_metrics([probe(200)]),
+                "during": main.phase_metrics([probe(504), probe(200), probe(None)]),
+                "after": main.phase_metrics([probe(200), probe(502), probe(200)]),
+            },
+            "time_to_recover_seconds": 0.1,
+            "recovered": False,
+        }
+        diagnosis = main.timeout_diagnosis(result, fault_activated=True)
+        self.assertIn("1 of 3 fault-window probes", diagnosis["root_cause"])
+        self.assertIn("total errors: 2", diagnosis["evidence"][1])
+        self.assertIn("After: 3 probes, errors: 1", diagnosis["evidence"][2])
+        self.assertIn("not verified", diagnosis["recommended_action"])
+        self.assertNotIn("confidence", diagnosis)
+
+
 if __name__ == "__main__":
     unittest.main()

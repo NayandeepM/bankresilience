@@ -85,22 +85,31 @@ class TimeoutIntegrationTests(unittest.TestCase):
                 self.assertTrue(accepted["accepted"])
                 self.assertEqual(fetch(api + "/api/experiments/edge-timeout", "POST", {"confirm": True})[0], 409)
 
+                live_samples = []
                 deadline = time.monotonic() + 40
                 while time.monotonic() < deadline:
                     status, state = fetch(api + "/api/state")
                     if not state["active"]:
                         break
+                    live_samples.append(state["experiment"].get("live_metrics", {}).get("during", {}).get("requests", 0))
                     time.sleep(0.5)
                 else:
                     self.fail("Timeout experiment did not finish within 40 seconds")
 
                 result = state["last_result"]
+                self.assertTrue(any(0 < count < 12 for count in live_samples))
+                self.assertTrue(any("Fault-window probes:" in event["message"] for event in state["events"]))
                 self.assertEqual(result["phases"]["before"]["requests"], 3)
                 self.assertEqual(result["phases"]["during"]["requests"], 12)
                 self.assertEqual(result["phases"]["after"]["requests"], 3)
                 self.assertEqual(result["phases"]["during"]["status_counts"], {"504": 12})
                 self.assertEqual(result["phases"]["after"]["errors"], 0)
                 self.assertTrue(result["recovered"])
+                self.assertEqual(result["status"], "recovered")
+                self.assertNotIn("confidence", result["diagnosis"])
+                self.assertIn("All 12 fault-window probes returned HTTP 504", result["diagnosis"]["root_cause"])
+                self.assertIn(f"average latency: {result['phases']['during']['latency_avg_ms']} ms", result["diagnosis"]["evidence"][1])
+                self.assertIn("After: 3 probes, errors: 0", result["diagnosis"]["evidence"][2])
                 self.assertIsNotNone(result["time_to_recover_seconds"])
                 self.assertEqual(fetch(api + "/proxy/")[0], 200)
                 status, history = fetch(api + "/api/history")

@@ -33,7 +33,7 @@ The proxy always forwards to the single `UPSTREAM_URL` configured when the backe
 1. In one terminal at the repository root, start the included stub: `python3 scripts/stub_bank.py` (Windows: `py scripts/stub_bank.py`). It listens on `127.0.0.1:8082` by default. Use `--port 8090` or set `PORT=8090` to change the port.
 2. Start the backend as below. If the stub uses another port, set `UPSTREAM_URL=http://127.0.0.1:8090` in the backend terminal first (PowerShell: `$env:UPSTREAM_URL="http://127.0.0.1:8090"`).
 3. Start the dashboard and run **Request timeout injection**. Other experiment buttons require the Bank of Anthos Compose stack.
-4. Watch the 12-second fault window and the timeout results panel. The run and its measurements are saved to `backend/experiments.db`.
+4. Watch the live Before/During/After probe counts and latency in the dashboard. The Observability Agent adds periodic measured updates to the timeline; the final diagnosis reports observed HTTP status codes and recovery checks, not an AI-generated confidence score. The run and its measurements are saved to `backend/experiments.db`.
 
 ## Run backend (macOS/Linux terminal 1)
 ```bash
