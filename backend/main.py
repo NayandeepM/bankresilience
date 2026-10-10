@@ -21,6 +21,28 @@ COMPOSE_PROJECT = "bank-of-anthos-local"
 ALLOWED_FAULT_TARGET = "ledgerwriter"
 FRONTEND_URL = "http://localhost:8082"
 FAILURE_WINDOW_SECONDS = 12
+EXPECTED_SERVICES = ["frontend", "userservice", "contacts", "ledgerwriter", "balancereader", "transactionhistory", "accounts-db", "ledger-db"]
+ALLOWED_SERVICES = set(EXPECTED_SERVICES)
+EXPERIMENTS: dict[str, dict[str, str]] = {
+    "ledgerwriter-outage": {
+        "name": "LedgerWriter outage",
+        "target": "ledgerwriter",
+        "failure_type": "crash",
+        "summary": "Stop ledgerwriter for 12 seconds, then restart it.",
+    },
+    "contacts-pause": {
+        "name": "Contacts slowdown/hang",
+        "target": "contacts",
+        "failure_type": "slowdown/hang",
+        "summary": "Pause contacts for 12 seconds, then unpause it.",
+    },
+    "transactionhistory-network-disconnect": {
+        "name": "TransactionHistory network failure",
+        "target": "transactionhistory",
+        "failure_type": "network failure",
+        "summary": "Disconnect transactionhistory from its Compose network for 12 seconds, then reconnect it.",
+    },
+}
 
 app = FastAPI(title="BankResilience Control Plane", version="0.1.0")
 app.add_middleware(
@@ -74,7 +96,7 @@ def get_project_containers() -> list[Any]:
 
 
 def get_service_container(service: str) -> Any:
-    if service not in {"frontend", "userservice", "contacts", "ledgerwriter", "balancereader", "transactionhistory", "accounts-db", "ledger-db"}:
+    if service not in ALLOWED_SERVICES:
         raise ValueError("Service is not allowlisted")
     for container in get_project_containers():
         if container.labels.get("com.docker.compose.service") == service:
@@ -127,6 +149,11 @@ def health() -> dict[str, Any]:
             "project": COMPOSE_PROJECT, "frontend_url": FRONTEND_URL}
 
 
+@app.get("/api/experiments")
+def list_experiments() -> list[dict[str, str]]:
+    return [{"id": key, **value} for key, value in EXPERIMENTS.items()]
+
+
 @app.get("/api/state")
 def get_state() -> dict[str, Any]:
     return {**state, "services": snapshot_containers(), "frontend_check": frontend_check()}
@@ -144,8 +171,23 @@ def history() -> list[dict[str, Any]]:
 
 @app.post("/api/experiments/ledgerwriter-outage")
 async def start_ledgerwriter_experiment(payload: StartExperimentRequest) -> dict[str, Any]:
+    return await start_experiment("ledgerwriter-outage", payload)
+
+
+@app.post("/api/experiments/contacts-pause")
+async def start_contacts_pause_experiment(payload: StartExperimentRequest) -> dict[str, Any]:
+    return await start_experiment("contacts-pause", payload)
+
+
+@app.post("/api/experiments/transactionhistory-network-disconnect")
+async def start_transactionhistory_network_experiment(payload: StartExperimentRequest) -> dict[str, Any]:
+    return await start_experiment("transactionhistory-network-disconnect", payload)
+
+
+async def start_experiment(experiment_key: str, payload: StartExperimentRequest) -> dict[str, Any]:
+    spec = EXPERIMENTS[experiment_key]
     if not payload.confirm:
-        raise HTTPException(status_code=400, detail="Explicit confirmation is required to stop LedgerWriter.")
+        raise HTTPException(status_code=400, detail=f"Explicit confirmation is required to run {spec['name']}.")
     if state["active"]:
         raise HTTPException(status_code=409, detail="An experiment is already running.")
     try:
@@ -153,11 +195,10 @@ async def start_ledgerwriter_experiment(payload: StartExperimentRequest) -> dict
         if any(s.get("status") == "unavailable" for s in services):
             raise RuntimeError(services[0].get("error", "Docker unavailable"))
         service_map = {s["service"]: s for s in services}
-        required = ["frontend", "userservice", "contacts", "ledgerwriter", "balancereader", "transactionhistory", "accounts-db", "ledger-db"]
-        missing = [name for name in required if name not in service_map]
+        missing = [name for name in EXPECTED_SERVICES if name not in service_map]
         if missing:
             raise RuntimeError("Expected Compose services not found: " + ", ".join(missing))
-        not_running = [name for name in required if service_map[name]["status"] != "running"]
+        not_running = [name for name in EXPECTED_SERVICES if service_map[name]["status"] != "running"]
         if not_running:
             raise RuntimeError("Healthy baseline required; these services are not running: " + ", ".join(not_running))
     except Exception as exc:
@@ -166,35 +207,74 @@ async def start_ledgerwriter_experiment(payload: StartExperimentRequest) -> dict
     experiment_id = str(uuid.uuid4())[:8]
     started_at = utc_now()
     state["active"] = True
-    state["experiment"] = {"id": experiment_id, "name": "LedgerWriter outage", "target": ALLOWED_FAULT_TARGET,
-                           "status": "running", "started_at": started_at, "failure_window_seconds": FAILURE_WINDOW_SECONDS}
+    state["experiment"] = {"id": experiment_id, "name": spec["name"], "target": spec["target"],
+                           "failure_type": spec["failure_type"], "status": "running", "started_at": started_at,
+                           "failure_window_seconds": FAILURE_WINDOW_SECONDS}
     state["events"] = []
     add_event("Healthy baseline passed: all eight expected services are running.", "Safety Controller")
-    asyncio.create_task(run_experiment(experiment_id, started_at))
+    asyncio.create_task(run_experiment(experiment_id, started_at, spec))
     return {"accepted": True, "id": experiment_id, "message": "Experiment started; the fault window is bounded and recovery runs automatically."}
 
 
-async def run_experiment(experiment_id: str, started_at: str) -> None:
-    result: dict[str, Any] = {"id": experiment_id, "target": ALLOWED_FAULT_TARGET, "started_at": started_at,
+def get_compose_network_name(container: Any) -> str:
+    container.reload()
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+    compose_networks = [
+        name for name, details in networks.items()
+        if details.get("NetworkID") and name not in {"bridge", "host", "none"}
+    ]
+    if not compose_networks:
+        raise RuntimeError(f"No Compose network found for {container.name}.")
+    return sorted(compose_networks)[0]
+
+
+def get_network_aliases(container: Any, network_name: str) -> list[str]:
+    container.reload()
+    network_details = (container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}).get(network_name, {})
+    return network_details.get("Aliases", []) or []
+
+
+async def run_experiment(experiment_id: str, started_at: str, spec: dict[str, str]) -> None:
+    target_service = spec["target"]
+    failure_type = spec["failure_type"]
+    result: dict[str, Any] = {"id": experiment_id, "name": spec["name"], "target": target_service,
+                              "failure_type": failure_type, "started_at": started_at,
                               "failure_window_seconds": FAILURE_WINDOW_SECONDS, "events": []}
     target = None
     injected = False
+    network_name = None
+    network_aliases = []
     try:
         before_services = snapshot_containers()
         result["baseline_services"] = before_services
         result["baseline_frontend"] = frontend_check()
         add_event("Captured container and frontend baseline.", "Observability Agent")
 
-        target = get_service_container(ALLOWED_FAULT_TARGET)
+        target = get_service_container(target_service)
         # Recheck the target immediately before the destructive operation.
         target.reload()
         if target.status != "running":
-            raise RuntimeError(f"Refusing injection: {ALLOWED_FAULT_TARGET} is not running (status={target.status}).")
-        add_event("Injecting approved fault: stopping ledgerwriter.", "Chaos Agent", "warning")
-        target.stop(timeout=3)
+            raise RuntimeError(f"Refusing injection: {target_service} is not running (status={target.status}).")
+
+        if failure_type == "crash":
+            add_event(f"Injecting approved fault: stopping {target_service}.", "Chaos Agent", "warning")
+            target.stop(timeout=3)
+        elif failure_type == "slowdown/hang":
+            add_event(f"Injecting approved fault: pausing {target_service}.", "Chaos Agent", "warning")
+            target.pause()
+        elif failure_type == "network failure":
+            network_name = get_compose_network_name(target)
+            network_aliases = get_network_aliases(target, network_name)
+            result["network_name"] = network_name
+            result["network_aliases"] = network_aliases
+            add_event(f"Injecting approved fault: disconnecting {target_service} from {network_name}.", "Chaos Agent", "warning")
+            docker_client.networks.get(network_name).disconnect(target)
+        else:
+            raise RuntimeError(f"Unknown failure type: {failure_type}")
+
         injected = True
         state["experiment"]["phase"] = "fault-injected"
-        add_event("LedgerWriter is stopped. Collecting downstream evidence for 12 seconds.", "Observability Agent", "warning")
+        add_event(f"{spec['name']} fault is active. Collecting downstream evidence for 12 seconds.", "Observability Agent", "warning")
         await asyncio.sleep(FAILURE_WINDOW_SECONDS)
 
         try:
@@ -210,20 +290,20 @@ async def run_experiment(experiment_id: str, started_at: str) -> None:
         result["fault_frontend"] = frontend_check()
         result["fault_services"] = snapshot_containers()
         result["target_logs"] = logs[-12000:]
-        add_event(f"Evidence captured. LedgerWriter status during fault: {fault_status}.", "Observability Agent")
+        add_event(f"Evidence captured. {target_service} status during fault: {fault_status}.", "Observability Agent")
 
         # Deterministic first-version diagnosis; an LLM is not permitted to run commands.
         diagnosis = {
-            "root_cause": "LedgerWriter service was deliberately stopped by the experiment.",
+            "root_cause": f"{target_service} experienced an injected {failure_type} fault.",
             "confidence": 0.99 if fault_status == "exited" else 0.75,
             "evidence": [f"Target container state during fault: {fault_status}",
-                         "The Chaos Agent recorded a successful stop action.",
+                         f"The Chaos Agent recorded a successful {failure_type} action.",
                          f"Frontend probe during fault: {result['fault_frontend']}"],
-            "recommended_action": "Start the allowlisted ledgerwriter container and verify service availability.",
+            "recommended_action": f"Recover {target_service}, confirm all Compose services are running, and verify the banking UI.",
         }
         result["diagnosis"] = diagnosis
         state["experiment"]["diagnosis"] = diagnosis
-        add_event("Diagnosis: LedgerWriter is unavailable because the injected stop action succeeded.", "Diagnosis Agent", "warning")
+        add_event(f"Diagnosis: {target_service} impact came from the injected {failure_type} fault.", "Diagnosis Agent", "warning")
 
     except Exception as exc:
         result["error"] = str(exc)
@@ -232,15 +312,24 @@ async def run_experiment(experiment_id: str, started_at: str) -> None:
         recovery_start = time.monotonic()
         if injected and target is not None:
             try:
-                add_event("Executing bounded recovery: starting ledgerwriter.", "Recovery Agent")
-                target.start()
+                add_event(f"Executing bounded recovery for {target_service}.", "Recovery Agent")
+                if failure_type == "crash":
+                    target.start()
+                elif failure_type == "slowdown/hang":
+                    target.unpause()
+                elif failure_type == "network failure":
+                    if not network_name:
+                        network_name = get_compose_network_name(target)
+                    docker_client.networks.get(network_name).connect(target, aliases=network_aliases)
                 deadline = time.monotonic() + 35
                 last_status = "unknown"
                 while time.monotonic() < deadline:
                     try:
                         target.reload()
                         last_status = target.status
-                        if last_status == "running":
+                        target_networks = target.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+                        network_recovered = failure_type != "network failure" or network_name in target_networks
+                        if last_status == "running" and network_recovered:
                             break
                     except Exception as exc:
                         last_status = str(exc)
@@ -252,7 +341,7 @@ async def run_experiment(experiment_id: str, started_at: str) -> None:
                 verified = last_status == "running" and result["recovery_frontend"].get("ok", False)
                 result["recovery_verified"] = verified
                 if verified:
-                    add_event("Recovery verification passed: LedgerWriter is running and frontend responds.", "Recovery Agent", "success")
+                    add_event(f"Recovery verification passed: {target_service} is running and frontend responds.", "Recovery Agent", "success")
                 else:
                     add_event("Recovery is not fully verified. Manual transaction check is required.", "Recovery Agent", "error")
             except Exception as exc:
@@ -271,6 +360,6 @@ async def run_experiment(experiment_id: str, started_at: str) -> None:
         state["active"] = False
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("INSERT OR REPLACE INTO experiments (id, started_at, finished_at, status, target, result_json) VALUES (?, ?, ?, ?, ?, ?)",
-                         (experiment_id, started_at, result["finished_at"], result["status"], ALLOWED_FAULT_TARGET, json.dumps(result)))
+                         (experiment_id, started_at, result["finished_at"], result["status"], target_service, json.dumps(result)))
         add_event("Experiment finished. Open the banking UI and verify a real transaction before marking end-to-end recovery complete.", "Control Plane",
                   "success" if result.get("recovery_verified") else "warning")

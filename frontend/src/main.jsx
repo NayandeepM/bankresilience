@@ -4,9 +4,10 @@ import { Activity, AlertTriangle, Bot, CheckCircle2, Circle, Clock3, Database, H
 import './style.css';
 
 const API = 'http://127.0.0.1:8000';
-const initialEdges = [
-  ['Frontend','UserService'], ['Frontend','Contacts'], ['Frontend','BalanceReader'], ['Frontend','LedgerWriter'], ['Frontend','TransactionHistory'],
-  ['UserService','Accounts DB'], ['Contacts','Accounts DB'], ['BalanceReader','Ledger DB'], ['LedgerWriter','Ledger DB'], ['LedgerWriter','BalanceReader'], ['TransactionHistory','Ledger DB']
+const fallbackExperiments = [
+  { id: 'ledgerwriter-outage', name: 'LedgerWriter outage', target: 'ledgerwriter', failure_type: 'crash', summary: 'Stop ledgerwriter for 12 seconds, then restart it.' },
+  { id: 'contacts-pause', name: 'Contacts slowdown/hang', target: 'contacts', failure_type: 'slowdown/hang', summary: 'Pause contacts for 12 seconds, then unpause it.' },
+  { id: 'transactionhistory-network-disconnect', name: 'TransactionHistory network failure', target: 'transactionhistory', failure_type: 'network failure', summary: 'Disconnect transactionhistory from its Compose network for 12 seconds, then reconnect it.' }
 ];
 
 function App() {
@@ -15,22 +16,24 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('Connect the control plane to inspect the local application.');
   const [history, setHistory] = useState([]);
+  const [experiments, setExperiments] = useState(fallbackExperiments);
   const refresh = async () => {
     try {
-      const [s, h, hist] = await Promise.all([
+      const [s, h, hist, exp] = await Promise.all([
         fetch(`${API}/api/state`).then(r => r.json()),
         fetch(`${API}/api/health`).then(r => r.json()),
-        fetch(`${API}/api/history`).then(r => r.json())
+        fetch(`${API}/api/history`).then(r => r.json()),
+        fetch(`${API}/api/experiments`).then(r => r.json())
       ]);
-      setData(s); setHealth(h); setHistory(hist);
+      setData(s); setHealth(h); setHistory(hist); setExperiments(exp);
     } catch { setHealth({ ok: false, docker_connected: false }); }
   };
   useEffect(() => { refresh(); const id = setInterval(refresh, 1500); return () => clearInterval(id); }, []);
-  const run = async () => {
-    if (!window.confirm('This will stop the local LedgerWriter service for up to 12 seconds, then attempt automatic recovery. Continue?')) return;
+  const run = async (experiment) => {
+    if (!window.confirm(`Run ${experiment.name}? This will inject a ${experiment.failure_type} fault into ${experiment.target} for up to 12 seconds, then attempt automatic recovery.`)) return;
     setLoading(true); setMessage('Running preflight safety checks…');
     try {
-      const res = await fetch(`${API}/api/experiments/ledgerwriter-outage`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirm:true}) });
+      const res = await fetch(`${API}/api/experiments/${experiment.id}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirm:true}) });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || 'Could not start experiment');
       setMessage(`Experiment ${body.id} started. Watch the event timeline below.`);
@@ -48,12 +51,15 @@ function App() {
   return <div className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-icon"><ShieldCheck size={22}/></div><div><div className="brand-name">BankResilience</div><div className="brand-sub">AUTONOMOUS RELIABILITY CONTROL PLANE</div></div></div><div className="top-right"><span className={`connection-dot ${health?.docker_connected ? 'live' : ''}`}></span><span>{health?.docker_connected ? 'Docker connected' : 'Control plane disconnected'}</span><button className="icon-button" onClick={refresh} title="Refresh"><RefreshCw size={16}/></button></div></header>
     <main>
-      <section className="hero"><div><div className="eyebrow">LOCAL LAB / BANK OF ANTHOS</div><h1>Resilience control center</h1><p>Inject a controlled fault, investigate the blast radius, and verify recovery on the running application.</p></div><div className="hero-actions"><div className="safe-pill"><ShieldCheck size={15}/> Guardrails enabled</div><button className="primary-button" disabled={loading || data.active || !health?.docker_connected} onClick={run}><Play size={16} fill="currentColor"/>{data.active ? 'Experiment running' : loading ? 'Starting…' : 'Run LedgerWriter experiment'}</button></div></section>
+      <section className="hero"><div><div className="eyebrow">LOCAL LAB / BANK OF ANTHOS</div><h1>Resilience control center</h1><p>Inject a controlled fault, investigate the blast radius, and verify recovery on the running application.</p></div><div className="hero-actions"><div className="safe-pill"><ShieldCheck size={15}/> Guardrails enabled</div></div></section>
       <section className="stats-grid">
         <div className="stat-card"><div className="stat-label">COMPOSE SERVICES</div><div className="stat-value">{services.filter(s=>s.status==='running').length}<span> / {services.filter(s=>s.service!=='Docker').length || 8}</span></div><div className="stat-foot"><HeartPulse size={14}/> live container state</div></div>
         <div className="stat-card"><div className="stat-label">CURRENT EXPERIMENT</div><div className="stat-value small-value">{data.active ? 'IN PROGRESS' : current?.status || 'Idle'}</div><div className="stat-foot"><Activity size={14}/> {current?.name || 'No active experiment'}</div></div>
         <div className="stat-card"><div className="stat-label">LAST RECOVERY</div><div className="stat-value">{data.last_result?.recovery_duration_seconds != null ? `${data.last_result.recovery_duration_seconds}s` : '—'}</div><div className="stat-foot"><RefreshCw size={14}/> container + frontend check</div></div>
         <div className="stat-card"><div className="stat-label">DOCKER ENGINE</div><div className={`stat-value small-value ${health?.docker_connected?'green-text':'red-text'}`}>{health?.docker_connected?'CONNECTED':'OFFLINE'}</div><div className="stat-foot"><Circle size={9} fill="currentColor"/> Loopback control API</div></div>
+      </section>
+      <section className="panel experiments-panel"><div className="panel-heading"><div><div className="panel-title"><Zap size={18}/> Experiments</div><div className="panel-subtitle">Three bounded failure types with automatic recovery</div></div><span className="tag">12 SECOND WINDOW</span></div>
+        <div className="experiment-grid">{experiments.map(experiment => <div className="experiment-card" key={experiment.id}><div className="experiment-type">{experiment.failure_type}</div><h3>{experiment.name}</h3><p>{experiment.summary}</p><div className="experiment-meta"><span>Target</span><strong>{experiment.target}</strong></div><button className="primary-button experiment-run" disabled={loading || data.active || !health?.docker_connected} onClick={() => run(experiment)}><Play size={15} fill="currentColor"/>{data.active ? 'Experiment running' : loading ? 'Starting…' : 'Run'}</button></div>)}</div>
       </section>
       <div className="main-grid">
         <section className="panel topology-panel"><div className="panel-heading"><div><div className="panel-title"><Network size={18}/> Service dependency map</div><div className="panel-subtitle">Declared application and database relationships</div></div><span className="tag">LIVE STATUS</span></div>
@@ -64,8 +70,8 @@ function App() {
       </div>
       <div className="lower-grid"><section className="panel"><div className="panel-heading"><div><div className="panel-title"><Clock3 size={18}/> Experiment timeline</div><div className="panel-subtitle">Agent events in chronological order</div></div><span className="count-tag">{(data.events||[]).length} events</span></div><div className="timeline">{(data.events||[]).length ? [...data.events].reverse().map((e,i)=><div className="timeline-item" key={e.time+i}><div className={`timeline-marker ${e.level||''}`}></div><div className="timeline-content"><div className="timeline-top"><strong>{e.agent}</strong><time>{new Date(e.time).toLocaleTimeString()}</time></div><div>{e.message}</div></div></div>) : <div className="empty-state"><Clock3 size={24}/><strong>No experiment events yet</strong><span>Run the LedgerWriter experiment to populate the timeline.</span></div>}</div></section>
       <section className="panel"><div className="panel-heading"><div><div className="panel-title"><AlertTriangle size={18}/> Diagnosis & recovery</div><div className="panel-subtitle">Latest evidence and verification</div></div></div>{diagnosis ? <div className="diagnosis"><div className="diagnosis-status"><AlertTriangle size={17}/><span>ROOT CAUSE IDENTIFIED</span><strong>{Math.round((diagnosis.confidence||0)*100)}% confidence</strong></div><h3>{diagnosis.root_cause}</h3><div className="evidence-title">Supporting evidence</div><ul>{(diagnosis.evidence||[]).map((e,i)=><li key={i}>{e}</li>)}</ul><div className="fix-box"><CheckCircle2 size={17}/><div><strong>Recommended recovery</strong><p>{diagnosis.recommended_action}</p></div></div>{data.last_result && <div className={`verification ${data.last_result.recovery_verified?'verified':'pending'}`}>{data.last_result.recovery_verified?'Container + frontend checks passed':'Transaction-level recovery still requires verification in the banking UI.'}</div>}</div> : <div className="empty-state"><ShieldCheck size={24}/><strong>Awaiting diagnostic evidence</strong><span>The Diagnosis Agent reports only after an experiment produces evidence.</span></div>}</section></div>
-      <section className="panel history-panel"><div className="panel-heading"><div><div className="panel-title"><Clock3 size={18}/> Recent experiments</div><div className="panel-subtitle">Saved locally in SQLite</div></div></div>{history.length ? <div className="history-table"><div className="history-row history-head"><span>Experiment</span><span>Target</span><span>Started</span><span>Result</span></div>{history.map(h=><div className="history-row" key={h.id}><span>#{h.id} LedgerWriter outage</span><span>{h.target}</span><span>{new Date(h.started_at).toLocaleString()}</span><span className={h.result?.recovery_verified?'green-text':'amber-text'}>{h.result?.recovery_verified?'Recovery checks passed':'Needs verification'}</span></div>)}</div>:<div className="history-empty">Experiment results will be recorded here.</div>}</section>
-      <footer><span>BankResilience MVP · Local-only control plane</span><span>Fault target allowlist: <b>ledgerwriter</b> · Max fault window: <b>12 seconds</b></span></footer>
+      <section className="panel history-panel"><div className="panel-heading"><div><div className="panel-title"><Clock3 size={18}/> Recent experiments</div><div className="panel-subtitle">Saved locally in SQLite</div></div></div>{history.length ? <div className="history-table"><div className="history-row history-head"><span>Experiment</span><span>Target</span><span>Started</span><span>Result</span></div>{history.map(h=><div className="history-row" key={h.id}><span>#{h.id} {h.result?.name || 'Experiment'}</span><span>{h.target}</span><span>{new Date(h.started_at).toLocaleString()}</span><span className={h.result?.recovery_verified?'green-text':'amber-text'}>{h.result?.recovery_verified?'Recovery checks passed':'Needs verification'}</span></div>)}</div>:<div className="history-empty">Experiment results will be recorded here.</div>}</section>
+      <footer><span>BankResilience MVP · Local-only control plane</span><span>Fault target allowlist: <b>ledgerwriter, contacts, transactionhistory</b> · Max fault window: <b>12 seconds</b></span></footer>
     </main>
   </div>;
 }
