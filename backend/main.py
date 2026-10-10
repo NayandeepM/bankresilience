@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,10 +19,18 @@ from pydantic import BaseModel
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "experiments.db"
-COMPOSE_PROJECT = "bank-of-anthos-local"
-ALLOWED_FAULT_TARGET = "ledgerwriter"
-FRONTEND_URL = "http://localhost:8082"
-FAILURE_WINDOW_SECONDS = 12
+COMPOSE_PROJECT = os.getenv("BANKRESILIENCE_COMPOSE_PROJECT", "bank-of-anthos-local")
+FRONTEND_URL = os.getenv("BANKRESILIENCE_FRONTEND_URL", "http://localhost:8082")
+
+
+def bounded_fault_window(raw_value: str) -> int:
+    try:
+        return min(12, max(1, int(raw_value)))
+    except ValueError:
+        return 12
+
+
+FAILURE_WINDOW_SECONDS = bounded_fault_window(os.getenv("BANKRESILIENCE_FAULT_WINDOW_SECONDS", "12"))
 EXPECTED_SERVICES = ["frontend", "userservice", "contacts", "ledgerwriter", "balancereader", "transactionhistory", "accounts-db", "ledger-db"]
 ALLOWED_SERVICES = set(EXPECTED_SERVICES)
 EXPERIMENTS: dict[str, dict[str, str]] = {
@@ -48,15 +58,13 @@ app = FastAPI(title="BankResilience Control Plane", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
 
-try:
-    docker_client = docker.from_env()
-except Exception:
-    docker_client = None
+docker_client: Any = None
 
 state: dict[str, Any] = {
     "active": False,
@@ -71,11 +79,12 @@ def utc_now() -> str:
 
 
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS experiments (
-            id TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT,
-            status TEXT, target TEXT, result_json TEXT
-        )""")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        with conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS experiments (
+                id TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT,
+                status TEXT, target TEXT, result_json TEXT
+            )""")
 
 
 init_db()
@@ -88,10 +97,44 @@ def add_event(message: str, agent: str = "Control Plane", level: str = "info") -
     return event
 
 
+def get_docker_client() -> Any:
+    global docker_client
+    if docker_client is not None:
+        try:
+            docker_client.ping()
+            return docker_client
+        except Exception:
+            docker_client = None
+
+    connection_attempts = [lambda: docker.from_env()]
+    desktop_sockets = [
+        Path.home() / ".docker" / "run" / "docker.sock",
+        Path.home() / ".docker" / "desktop" / "docker.sock",
+    ]
+    connection_attempts.extend(
+        lambda socket_path=socket_path: docker.DockerClient(base_url=f"unix://{socket_path}")
+        for socket_path in desktop_sockets
+        if socket_path.exists()
+    )
+
+    last_error: Exception | None = None
+    for connect in connection_attempts:
+        try:
+            candidate = connect()
+            candidate.ping()
+            docker_client = candidate
+            return docker_client
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "Docker SDK cannot connect. Ensure Docker Desktop is running and install backend requirements."
+    ) from last_error
+
+
 def get_project_containers() -> list[Any]:
-    if docker_client is None:
-        raise RuntimeError("Docker SDK cannot connect. Ensure Docker Desktop is running and install backend requirements.")
-    containers = docker_client.containers.list(all=True, filters={"label": f"com.docker.compose.project={COMPOSE_PROJECT}"})
+    client = get_docker_client()
+    containers = client.containers.list(all=True, filters={"label": f"com.docker.compose.project={COMPOSE_PROJECT}"})
     return containers
 
 
@@ -121,6 +164,11 @@ def snapshot_containers() -> list[dict[str, Any]]:
     return sorted(result, key=lambda x: x["service"])
 
 
+def expected_services_are_running(services: list[dict[str, Any]]) -> bool:
+    service_map = {service.get("service"): service for service in services}
+    return all(service_map.get(name, {}).get("status") == "running" for name in EXPECTED_SERVICES)
+
+
 def frontend_check() -> dict[str, Any]:
     start = time.monotonic()
     try:
@@ -140,9 +188,8 @@ def health() -> dict[str, Any]:
     docker_ok = False
     docker_error = None
     try:
-        if docker_client:
-            docker_client.ping()
-            docker_ok = True
+        get_docker_client()
+        docker_ok = True
     except Exception as exc:
         docker_error = str(exc)
     return {"ok": docker_ok, "docker_connected": docker_ok, "docker_error": docker_error,
@@ -161,7 +208,7 @@ def get_state() -> dict[str, Any]:
 
 @app.get("/api/history")
 def history() -> list[dict[str, Any]]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM experiments ORDER BY started_at DESC LIMIT 20").fetchall()
     return [{"id": r["id"], "started_at": r["started_at"], "finished_at": r["finished_at"],
@@ -219,13 +266,23 @@ async def start_experiment(experiment_key: str, payload: StartExperimentRequest)
 def get_compose_network_name(container: Any) -> str:
     container.reload()
     networks = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
-    compose_networks = [
+    candidate_names = [
         name for name, details in networks.items()
         if details.get("NetworkID") and name not in {"bridge", "host", "none"}
     ]
-    if not compose_networks:
+    if not candidate_names:
         raise RuntimeError(f"No Compose network found for {container.name}.")
-    return sorted(compose_networks)[0]
+    client = get_docker_client()
+    for name in sorted(candidate_names):
+        network = client.networks.get(name)
+        labels = network.attrs.get("Labels", {}) or {}
+        if labels.get("com.docker.compose.project") == COMPOSE_PROJECT:
+            return name
+    if len(candidate_names) == 1:
+        return candidate_names[0]
+    raise RuntimeError(
+        f"Could not safely choose a Compose network for {container.name}: {', '.join(sorted(candidate_names))}."
+    )
 
 
 def get_network_aliases(container: Any, network_name: str) -> list[str]:
@@ -268,13 +325,18 @@ async def run_experiment(experiment_id: str, started_at: str, spec: dict[str, st
             result["network_name"] = network_name
             result["network_aliases"] = network_aliases
             add_event(f"Injecting approved fault: disconnecting {target_service} from {network_name}.", "Chaos Agent", "warning")
-            docker_client.networks.get(network_name).disconnect(target)
+            get_docker_client().networks.get(network_name).disconnect(target)
         else:
             raise RuntimeError(f"Unknown failure type: {failure_type}")
 
         injected = True
         state["experiment"]["phase"] = "fault-injected"
-        add_event(f"{spec['name']} fault is active. Collecting downstream evidence for 12 seconds.", "Observability Agent", "warning")
+        add_event(
+            f"{spec['name']} fault is active. Collecting downstream evidence for "
+            f"{FAILURE_WINDOW_SECONDS} seconds.",
+            "Observability Agent",
+            "warning",
+        )
         await asyncio.sleep(FAILURE_WINDOW_SECONDS)
 
         try:
@@ -320,7 +382,7 @@ async def run_experiment(experiment_id: str, started_at: str, spec: dict[str, st
                 elif failure_type == "network failure":
                     if not network_name:
                         network_name = get_compose_network_name(target)
-                    docker_client.networks.get(network_name).connect(target, aliases=network_aliases)
+                    get_docker_client().networks.get(network_name).connect(target, aliases=network_aliases)
                 deadline = time.monotonic() + 35
                 last_status = "unknown"
                 while time.monotonic() < deadline:
@@ -338,7 +400,14 @@ async def run_experiment(experiment_id: str, started_at: str, spec: dict[str, st
                 result["recovery_duration_seconds"] = round(time.monotonic() - recovery_start, 2)
                 result["recovery_frontend"] = frontend_check()
                 result["recovery_services"] = snapshot_containers()
-                verified = last_status == "running" and result["recovery_frontend"].get("ok", False)
+                result["all_services_running"] = expected_services_are_running(result["recovery_services"])
+                result["network_recovered"] = network_recovered
+                verified = (
+                    last_status == "running"
+                    and network_recovered
+                    and result["all_services_running"]
+                    and result["recovery_frontend"].get("ok", False)
+                )
                 result["recovery_verified"] = verified
                 if verified:
                     add_event(f"Recovery verification passed: {target_service} is running and frontend responds.", "Recovery Agent", "success")
@@ -358,8 +427,9 @@ async def run_experiment(experiment_id: str, started_at: str, spec: dict[str, st
         state["experiment"]["result"] = result
         state["last_result"] = result
         state["active"] = False
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT OR REPLACE INTO experiments (id, started_at, finished_at, status, target, result_json) VALUES (?, ?, ?, ?, ?, ?)",
-                         (experiment_id, started_at, result["finished_at"], result["status"], target_service, json.dumps(result)))
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO experiments (id, started_at, finished_at, status, target, result_json) VALUES (?, ?, ?, ?, ?, ?)",
+                             (experiment_id, started_at, result["finished_at"], result["status"], target_service, json.dumps(result)))
         add_event("Experiment finished. Open the banking UI and verify a real transaction before marking end-to-end recovery complete.", "Control Plane",
                   "success" if result.get("recovery_verified") else "warning")

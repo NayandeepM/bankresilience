@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { Activity, AlertTriangle, Bot, CheckCircle2, Circle, Clock3, Database, HeartPulse, Network, Play, RefreshCw, ShieldCheck, Terminal, Zap } from 'lucide-react';
 import './style.css';
 
-const API = 'http://127.0.0.1:8000';
+const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 const fallbackExperiments = [
   { id: 'ledgerwriter-outage', name: 'LedgerWriter outage', target: 'ledgerwriter', failure_type: 'crash', summary: 'Stop ledgerwriter for 12 seconds, then restart it.' },
   { id: 'contacts-pause', name: 'Contacts slowdown/hang', target: 'contacts', failure_type: 'slowdown/hang', summary: 'Pause contacts for 12 seconds, then unpause it.' },
