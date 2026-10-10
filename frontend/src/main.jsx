@@ -26,17 +26,39 @@ function App() {
     } catch { setHealth({ ok: false, docker_connected: false }); }
   };
   useEffect(() => { refresh(); const id = setInterval(refresh, 1500); return () => clearInterval(id); }, []);
-  const run = async () => {
-    if (!window.confirm('This will stop the local LedgerWriter service for up to 12 seconds, then attempt automatic recovery. Continue?')) return;
-    setLoading(true); setMessage('Running preflight safety checks…');
+  const run = async (endpoint, experimentName) => {
+    if (
+      !window.confirm(
+        `This will run the ${experimentName} experiment on the local Bank of Anthos environment. Continue?`
+      )
+    ) return;
+
+    setLoading(true);
+    setMessage(`Running preflight safety checks for ${experimentName}...`);
+
     try {
-      const res = await fetch(`${API}/api/experiments/ledgerwriter-outage`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({confirm:true}) });
+      const res = await fetch(`${API}${endpoint}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({confirm: true}),
+      });
+
       const body = await res.json();
-      if (!res.ok) throw new Error(body.detail || 'Could not start experiment');
-      setMessage(`Experiment ${body.id} started. Watch the event timeline below.`);
+
+      if (!res.ok) {
+        throw new Error(body.detail || 'Could not start experiment');
+      }
+
+      setMessage(
+        `${experimentName} experiment ${body.id} started. Watch the event timeline below.`
+      );
+
       await refresh();
-    } catch (e) { setMessage(e.message); }
-    finally { setLoading(false); }
+    } catch (e) {
+      setMessage(e.message);
+    } finally {
+      setLoading(false);
+    }
   };
   const services = data.services || [];
   const statusOf = name => services.find(s => s.service === name)?.status || 'unknown';
@@ -48,7 +70,37 @@ function App() {
   return <div className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-icon"><ShieldCheck size={22}/></div><div><div className="brand-name">BankResilience</div><div className="brand-sub">AUTONOMOUS RELIABILITY CONTROL PLANE</div></div></div><div className="top-right"><span className={`connection-dot ${health?.docker_connected ? 'live' : ''}`}></span><span>{health?.docker_connected ? 'Docker connected' : 'Control plane disconnected'}</span><button className="icon-button" onClick={refresh} title="Refresh"><RefreshCw size={16}/></button></div></header>
     <main>
-      <section className="hero"><div><div className="eyebrow">LOCAL LAB / BANK OF ANTHOS</div><h1>Resilience control center</h1><p>Inject a controlled fault, investigate the blast radius, and verify recovery on the running application.</p></div><div className="hero-actions"><div className="safe-pill"><ShieldCheck size={15}/> Guardrails enabled</div><button className="primary-button" disabled={loading || data.active || !health?.docker_connected} onClick={run}><Play size={16} fill="currentColor"/>{data.active ? 'Experiment running' : loading ? 'Starting…' : 'Run LedgerWriter experiment'}</button></div></section>
+      <section className="hero"><div><div className="eyebrow">LOCAL LAB / BANK OF ANTHOS</div><h1>Resilience control center</h1><p>Inject a controlled fault, investigate the blast radius, and verify recovery on the running application.</p></div><div className="hero-actions"><div className="safe-pill"><ShieldCheck size={15}/> Guardrails enabled</div><button
+  className="primary-button"
+  disabled={loading || data.active || !health?.docker_connected}
+  onClick={() =>
+    run(
+      '/api/experiments/ledgerwriter-outage',
+      'LedgerWriter outage'
+    )
+  }
+>
+  <Play size={16} fill="currentColor" />
+  {data.active
+    ? 'Experiment running'
+    : loading
+    ? 'Starting...'
+    : 'Run LedgerWriter experiment'}
+</button>
+
+<button
+  className="primary-button"
+  disabled={loading || data.active || !health?.docker_connected}
+  onClick={() =>
+    run(
+      '/api/experiments/network-slowdown',
+      'Network slowdown'
+    )
+  }
+>
+  <Network size={16} />
+  Run Network Slowdown
+</button></div></section>
       <section className="stats-grid">
         <div className="stat-card"><div className="stat-label">COMPOSE SERVICES</div><div className="stat-value">{services.filter(s=>s.status==='running').length}<span> / {services.filter(s=>s.service!=='Docker').length || 8}</span></div><div className="stat-foot"><HeartPulse size={14}/> live container state</div></div>
         <div className="stat-card"><div className="stat-label">CURRENT EXPERIMENT</div><div className="stat-value small-value">{data.active ? 'IN PROGRESS' : current?.status || 'Idle'}</div><div className="stat-foot"><Activity size={14}/> {current?.name || 'No active experiment'}</div></div>
