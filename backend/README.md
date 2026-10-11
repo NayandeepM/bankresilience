@@ -1,29 +1,18 @@
-# BankResilience backend (MVP)
+# BankResilience backend
 
-Runs on the host and controls only the `ledgerwriter` service in the Compose project `bank-of-anthos-local`.
+See the repository README for current setup, architecture, safety model, API, scoring, verification commands and the evaluator demo. Run one loopback-only worker without auto-reload during experiments.
 
-## Prerequisites
-- Docker Desktop running
-- Bank of Anthos Compose project started and all 8 expected containers running
-- Python 3.10+
+- `main.py`: local Docker adapters, shared experiment lifecycle, SQLite persistence, probes, watchdog and FastAPI endpoints. It owns the bounded outage, latency, packet-loss, CPU-stress and process-pause mutations and their exact inverses.
+- `advice.py`: fault-blind Gemini contract/input, evidence references, generic advisory capabilities and observation-supported action checks.
+- `control.py`: structured contracts, deterministic safety validation, robust statistics, score and explicit fallback reasoning.
+- `reasoning.py`: isolated Gemini JSON interface with bounded request timeouts and validated output; no Docker/shell capabilities.
+- `tests/`: guardrails, AI boundary and lifecycle recovery tests.
 
-## Start (PowerShell)
-```powershell
-cd backend
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
-```
+- `resilience.py`: owned Docker standby/gateway setup, routing journal/rollback, healthy-route validation and bounded Gemini resilience advice contract.
+- `gateway.py`: independent primary/standby monitoring and sticky failover; exactly one dispatch per write, authenticated control endpoint and credential-free counters.
+- `suite.py`: authenticated local-demo flow checks, bounded optional one-cent payments, measured suite aggregation and final-summary contract.
+- Suites use the same bounded experiment lifecycle, stop on unverified recovery and persist in the SQLite `suites` table. Interrupted suites are marked interrupted on restart and never resume injection automatically.
+- The default suite is sequential by design. The combinations suite runs latency + CPU and packet loss + CPU, with both components active in each run, bounded cleanup for both mutations, and verified recovery between pairs. POST `/api/suites` with `confirm: true, combinations_only: true, verify_payments: false` to run it. Arbitrary combinations are not supported.
 
-Open `http://127.0.0.1:8000/docs` to inspect the API. The API binds to loopback only. Do not expose it to your LAN: it has permission to stop/start an allowlisted container.
-
-## Safety
-- Only `ledgerwriter` is a fault target.
-- The API requires explicit `confirm: true`.
-- It refuses to run unless all eight expected Compose services are running.
-- Only one experiment can run at a time.
-- The fault window is capped at 12 seconds and the recovery is attempted in `finally`.
-- It never deletes containers, images, or database volumes.
-
-The first version verifies the container is running and the frontend responds after recovery. This is not proof that a transfer succeeded; manually verify a transaction in the browser and use the dashboard's transaction-check step before claiming full end-to-end recovery.
+- `planner.py`: dependency-aware weakness ranking, brief evidence justifications, historical combination comparisons, and overall score with explicit single-fault coverage. Served by `/api/analysis`; `/api/planner` retains the validated Gemini experiment-selection contract.
+- `findings.py`: exports the three original recovered experiments and saved Gemini recommendations to root `FINDINGS.md`. Run `.venv/bin/python findings.py`; optional `--database` and `--output` select evidence and destination. No injection or payments occur. It also writes `FINDINGS.json` with structured recommendations and a content hash. The dashboard reads `/api/findings`, regenerates it with `POST /api/findings`, and downloads the Markdown from `/api/findings/download`. Generation is blocked during an active experiment, suite, or baseline collection. Separately edited Markdown remains downloadable; refreshing synchronizes its insight cards.

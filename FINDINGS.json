@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-11T06:57:14.364959+00:00",
+  "scope": "Latest recovered runs of the three original experiments. Additional faults and combinations remain in experiment history.",
+  "coverage": {
+    "measured": 3,
+    "expected": 3
+  },
+  "overall_score": 67.7,
+  "experiment_ids": [
+    "978c5dfe",
+    "e6f77930",
+    "ea692ed5"
+  ],
+  "insights": [
+    {
+      "title": "Evaluate automated restart policy",
+      "priority": "HIGH",
+      "target": "ledgerwriter",
+      "hypothesis": "If a liveness probe is configured, then the orchestrator should automatically restart the ledgerwriter process upon exit.",
+      "evidence_refs": [
+        "observation-1",
+        "target-logs"
+      ],
+      "verification": "Simulate a process exit and verify if the orchestrator triggers an automatic restart.",
+      "configuration_status": "not-inspected",
+      "experiment_id": "e6f77930",
+      "experiment_type": "ledgerwriter-outage",
+      "fault_name": "LedgerWriter outage",
+      "source": "gemini"
+    },
+    {
+      "title": "Evaluate automated process health monitoring",
+      "priority": "HIGH",
+      "target": "contacts",
+      "hypothesis": "If automated monitoring detects paused processes, then the system can trigger alerts or auto-unpause to reduce MTTR.",
+      "evidence_refs": [
+        "observation-1",
+        "observation-2"
+      ],
+      "verification": "Verify that alerts trigger when a container enters a paused state.",
+      "configuration_status": "not-inspected",
+      "experiment_id": "ea692ed5",
+      "experiment_type": "contacts-pause",
+      "fault_name": "Contacts hang",
+      "source": "gemini"
+    },
+    {
+      "title": "Evaluate circuit breaker configuration for ledgerwriter dependencies",
+      "priority": "MEDIUM",
+      "target": "ledgerwriter",
+      "hypothesis": "If circuit breakers are implemented on ledgerwriter's calls to ledger-db, then cascading latency impact on the frontend can be mitigated during future network impairments.",
+      "evidence_refs": [
+        "topology",
+        "measurement-scope"
+      ],
+      "verification": "Simulate network latency on ledger-db and observe if ledgerwriter trips the circuit breaker to protect the frontend.",
+      "configuration_status": "not-inspected",
+      "experiment_id": "978c5dfe",
+      "experiment_type": "network-slowdown",
+      "fault_name": "Network slowdown",
+      "source": "gemini"
+    },
+    {
+      "title": "Evaluate shutdown signal handling",
+      "priority": "MEDIUM",
+      "target": "ledgerwriter",
+      "hypothesis": "Whether the service is receiving unexpected SIGTERM signals causing premature graceful shutdowns.",
+      "evidence_refs": [
+        "target-logs"
+      ],
+      "verification": "Review infrastructure logs for unexpected termination signals sent to the ledgerwriter container.",
+      "configuration_status": "not-inspected",
+      "experiment_id": "e6f77930",
+      "experiment_type": "ledgerwriter-outage",
+      "fault_name": "LedgerWriter outage",
+      "source": "gemini"
+    }
+  ],
+  "content_sha256": "2c01a437235ea0b3961d7ecc7e5b9d2372c1ef9b998ae918286a8cef84a3e2a6"
+}
